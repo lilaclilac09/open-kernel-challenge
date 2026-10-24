@@ -1,14 +1,18 @@
 # okc: problem=muse_bf16_proj
-"""BF16 projections v4：把 dispatch 请回来。
+"""BF16 projections v4：把大 m 的 dispatch 请回来。
 
-相对 v3（mm-only + ROUTER_FP32=8 + contiguous）的测量结论：
-- v3 = 1.022× / 4727 µs；此前最好 check = 1.050× / 4599 µs。
-- 最大回退：verify1 router m=8 —— FP32 单 kernel ~26µs，hi/lo ~14µs（~1.81×）。
-  题面「m<=8 走 FP32」是 baseline 规则，不是最优；实测阈值保持 7。
-- 次大回退：verify32 qkv_gate m=256 —— mm-only 0.94×，dispatch 明显更好。
+相对此前最好 check（~1.042x，4599 µs）只改一处，其余原样：
+- x 先 .contiguous() 兜底：harness 给的 x 若已连续就是 no-op；
+  若不连续，这一行能避免 torch.mm / dispatch 走慢路径。
 
-本版相对已验证赢面（pretranspose + contiguous wt + hybrid router m<=7）：
-只加一处：x = data["x"].contiguous()。harness 已连续则 no-op。
+相对 v3（1.022x，4727 µs）改回两处——v3 的实测结论就是这两处不能动：
+1. 非 router 恢复 m >= 192 走 SGLang dispatch，m < 192 仍走 torch.mm。
+   v3 全走 torch.mm 反而慢了约 128 µs，说明 dispatch 在大 m 有真本事。
+2. router FP32 阈值 8 -> 7。m = 8 那档实测：FP32 约 26 µs，
+   hi+lo 约 14 µs，hi+lo 明显更好，所以 m = 8 必须走 hi+lo。
+
+其余结构和最好版一致：预转置 + contiguous 权重、unpooler 预切片、
+router hi+lo 预转置。纯 Triton 版用户已实测更慢，本版不碰。
 """
 
 from typing import Any, TypedDict
@@ -38,7 +42,6 @@ class Inputs(TypedDict):
     config: Config
 
 
-# Measured: m==8 FP32 ~26µs vs hi/lo ~14µs. Keep 7.
 ROUTER_FP32_MAX_TOKENS = 7
 
 
@@ -78,14 +81,9 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     m = cfg["m"]
 
     if layer != "router":
-        # torch.mm on contiguous [K,n] wins mid sizes (esp. pooler);
-        # dispatch wins large-m qkv (m=256).
         if m >= 192:
             return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
-        wt = _w_t(state, layer, n)
-        if wt.is_contiguous() and wt.shape[1] == n:
-            return torch.mm(x, wt)
-        return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
+        return torch.mm(x, _w_t(state, layer, n))
 
     if m <= ROUTER_FP32_MAX_TOKENS:
         return F.linear(x.float(), state["router"])
