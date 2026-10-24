@@ -1,9 +1,10 @@
 # okc: problem=muse_bf16_proj
-"""BF16 projections: contiguous pre-transpose mm + always router hi/lo BF16 (FP32 acc)."""
+"""BF16 projections: contiguous pre-transpose mm; hybrid router (FP32 m<8, hi/lo else)."""
 
 from typing import Any, TypedDict
 
 import torch
+import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import _bf16_gemm_dispatch_impl
 
 
@@ -25,6 +26,11 @@ class Config(TypedDict):
 class Inputs(TypedDict):
     x: torch.Tensor
     config: Config
+
+
+# SGLang uses FP32 F.linear up to 8 tokens; at m==8 that path is ~26µs vs ~14µs hi/lo.
+# At m==1 FP32 (~10µs) beats two BF16 GEMMs (~14µs). Hybrid: FP32 for m<8, hi/lo for m>=8.
+ROUTER_FP32_MAX_TOKENS = 7
 
 
 def prepare(weights: Weights) -> dict[str, Any]:
@@ -60,14 +66,20 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     cfg = data["config"]
     layer = cfg["layer"]
     n = cfg["n"]
+    m = cfg["m"]
 
     if layer != "router":
+        # torch.mm on contiguous [K,n] wins on mid sizes (esp. pooler); dispatch is
+        # slightly better on large-m qkv (m=256 ~0.94x with mm-only).
+        if m >= 192:
+            return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
         wt = _w_t(state, layer, n)
         if wt.is_contiguous() and wt.shape[1] == n:
             return torch.mm(x, wt)
         return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
 
-    # Always hi/lo with FP32 accumulation (legal at any m). Avoids slow FP32 F.linear at m<=8.
+    if m <= ROUTER_FP32_MAX_TOKENS:
+        return F.linear(x.float(), state["router"])
     acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
     acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
     return acc

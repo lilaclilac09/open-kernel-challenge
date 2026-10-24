@@ -1,16 +1,20 @@
-# muse_bf16_proj A/B/C/D
+# muse_bf16_proj A/B results
 
-## A — baseline-like (0eadad47a2dc4fdd)
-passed=True speedup≈1.0036 CI[0.99,1.02] score_us≈4813.5
-Profile: cuBLASLt nvjet splitK already used; router m=8 FP32 path ~26µs (sol 1.8) is the worst gap.
+| ID | Variant | µs | × | Notes |
+|---|---|---:|---:|---|
+| 0eadad47 | A baseline-like | 4813.5 | 1.004 | cuBLASLt nvjet; router m=8 FP32 ~26µs |
+| 0abe9ee3 | B naive Triton all sizes | 8258.6 | 0.585 | correct, slow |
+| 8b4524be | C Triton GEMV only m=1 | 5555.0 | 0.870 | m=1 loses to nvjet |
+| e4f4865e | D contig transpose + torch.mm; SGLang router | 4734.4 | 1.020 | pooler wins; keep mm |
+| 12c92415 | E D + always hi/lo router | 4638.0 | **1.042** | verify1 router 1.82×; decode1 router 0.72× |
+| c945f1a2 | E scored submit | (queued) | | same hash as 12c |
+| 10ffe3c0 | F hybrid router m<8 FP32 else hi/lo + mm/dispatch split | (queued) | | |
 
-## B — Triton GEMV m==1 + Triton GEMM m<=32 + always hi/lo (0abe9ee3d7ba4d8a)
-passed=True speedup≈0.585 score_us≈8259 — correct but much slower.
+## Takeaways
+- Naive Triton GEMV cannot beat H200 nvjet splitK for these shapes.
+- Contiguous `W.t()` + `torch.mm` beats `_bf16_gemm_dispatch` on pooler/unpooler mid-m.
+- Always hi/lo helps m=8 router a lot but hurts m=1 (~14µs vs ~10µs FP32).
+- Next: hybrid router threshold; large-m fallback to dispatch; then CuTe/CUTLASS for small-M.
 
-## C — Triton GEMV only m==1 else baseline (8b4524be41d64ebf)
-passed=True speedup≈0.870 — m=1 shapes ~0.3–0.7× (naive Triton GEMV loses to nvjet).
-
-## D — torch.mm on prepare()-transposed contiguous [K,N] (e4f4865ee296404b)
-passed=True speedup≈1.020 CI[1.005,1.036] score_us≈4734 — slight gain, still <1.05; do not scored-submit yet.
-
-## E — next: D + always router hi/lo (even m<=8) to attack 26µs FP32 path
+## Attention
+- 78ab10ad: baseline/FA3 submission check (queued)
