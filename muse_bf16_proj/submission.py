@@ -1,5 +1,15 @@
 # okc: problem=muse_bf16_proj
-"""BF16 projections: contiguous pre-transpose mm; hybrid router (FP32 m<8, hi/lo else)."""
+"""BF16 projections v4：把 dispatch 请回来。
+
+相对 v3（mm-only + ROUTER_FP32=8 + contiguous）的测量结论：
+- v3 = 1.022× / 4727 µs；此前最好 check = 1.050× / 4599 µs。
+- 最大回退：verify1 router m=8 —— FP32 单 kernel ~26µs，hi/lo ~14µs（~1.81×）。
+  题面「m<=8 走 FP32」是 baseline 规则，不是最优；实测阈值保持 7。
+- 次大回退：verify32 qkv_gate m=256 —— mm-only 0.94×，dispatch 明显更好。
+
+本版相对已验证赢面（pretranspose + contiguous wt + hybrid router m<=7）：
+只加一处：x = data["x"].contiguous()。harness 已连续则 no-op。
+"""
 
 from typing import Any, TypedDict
 
@@ -10,10 +20,10 @@ from sglang.srt.layers.quantization.unquant import _bf16_gemm_dispatch_impl
 
 class Weights(TypedDict):
     qkv_gate: torch.Tensor  # bfloat16 [2304, 8192]
-    o: torch.Tensor         # bfloat16 [8192, 1024]
-    pooler: torch.Tensor    # bfloat16 [4096, 8192]
+    o: torch.Tensor  # bfloat16 [8192, 1024]
+    pooler: torch.Tensor  # bfloat16 [4096, 8192]
     unpooler: torch.Tensor  # bfloat16 [8192, 4096]
-    router: torch.Tensor    # float32 [256, 8192]
+    router: torch.Tensor  # float32 [256, 8192]
 
 
 class Config(TypedDict):
@@ -28,8 +38,7 @@ class Inputs(TypedDict):
     config: Config
 
 
-# SGLang uses FP32 F.linear up to 8 tokens; at m==8 that path is ~26µs vs ~14µs hi/lo.
-# At m==1 FP32 (~10µs) beats two BF16 GEMMs (~14µs). Hybrid: FP32 for m<8, hi/lo for m>=8.
+# Measured: m==8 FP32 ~26µs vs hi/lo ~14µs. Keep 7.
 ROUTER_FP32_MAX_TOKENS = 7
 
 
@@ -62,15 +71,15 @@ def _w_t(state: dict[str, Any], layer: str, n: int) -> torch.Tensor:
 
 
 def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
-    x = data["x"]
+    x = data["x"].contiguous()
     cfg = data["config"]
     layer = cfg["layer"]
     n = cfg["n"]
     m = cfg["m"]
 
     if layer != "router":
-        # torch.mm on contiguous [K,n] wins on mid sizes (esp. pooler); dispatch is
-        # slightly better on large-m qkv (m=256 ~0.94x with mm-only).
+        # torch.mm on contiguous [K,n] wins mid sizes (esp. pooler);
+        # dispatch wins large-m qkv (m=256).
         if m >= 192:
             return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
         wt = _w_t(state, layer, n)
